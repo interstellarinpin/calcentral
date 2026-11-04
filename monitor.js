@@ -65,54 +65,119 @@ export async function readOpenValue(page) {
   return null;
 }
 
-// Re-run the class search by clicking the blue search (magnifying-glass) button.
-// A full page reload loses PeopleSoft's search results, so instead we trigger the
-// search again in place. We scan every frame and try a few selectors, since the
-// button's exact markup isn't guaranteed. Falls back to pressing Enter in the
-// search box if no button is found.
+// Re-run the class search. A full page reload loses PeopleSoft's search results,
+// so instead we re-trigger the search in place. PeopleSoft's keyword search submits
+// when you press Enter in the box, which is the most reliable path, so we try that
+// first, then fall back to clicking a magnifying-glass / search button. We scan
+// every frame since the content lives in nested iframes.
 export async function clickSearch(page) {
-  const buttonSelectors = [
-    'a[aria-label*="search" i]',
-    'button[aria-label*="search" i]',
-    '[title*="search" i][role="button"]',
-    'a[title*="search" i]',
-    'button[title*="search" i]',
-    'input[type="button"][value*="search" i]',
-    'input[type="submit"][value*="search" i]',
-    '[id*="SEARCH_BTN" i]',
-    '[id*="SRCH_BTN" i]',
-  ];
-
+  // 1) Press Enter in the visible keyword box. We can't use input[type="text"]
+  //    alone — PeopleSoft inputs often have NO type attribute (so they default to
+  //    text but don't match [type=text]). Enumerate real matches and pick a
+  //    visible, editable one rather than blindly taking .first() (often hidden).
+  const editableInputs =
+    'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="image"])';
   for (const frame of page.frames()) {
-    for (const sel of buttonSelectors) {
-      const loc = frame.locator(sel).first();
+    let inputs;
+    try {
+      inputs = frame.locator(editableInputs);
+    } catch {
+      continue;
+    }
+    const n = await inputs.count().catch(() => 0);
+    for (let i = 0; i < n; i++) {
+      const el = inputs.nth(i);
       try {
-        if (await loc.isVisible({ timeout: 300 })) {
-          await loc.click({ timeout: 5000 });
-          return `clicked ${sel}`;
+        if ((await el.isVisible()) && (await el.isEditable())) {
+          await el.click({ timeout: 3000 });
+          await el.press("Enter");
+          return "pressed Enter in keyword box";
         }
       } catch {
-        // selector not present / not clickable in this frame — keep trying
+        // not the right input — keep scanning
       }
     }
   }
 
-  // Fallback: pressing Enter inside the search box re-runs the search too.
+  // 2) Fall back to clicking a search button / magnifier across all frames.
+  const buttonSelectors = [
+    '[aria-label*="search" i]',
+    '[title*="search" i]',
+    '[id*="SEARCH_BTN" i]',
+    '[id*="SRCH_BTN" i]',
+    '[id*="SEARCH" i][role="button"]',
+    'button[class*="search" i]',
+    'a[class*="search" i]',
+    'button:has(svg)',
+  ];
   for (const frame of page.frames()) {
-    const box = frame
-      .locator('input[type="search"], [role="searchbox"], input[type="text"]')
-      .first();
-    try {
-      if (await box.isVisible({ timeout: 300 })) {
-        await box.press("Enter");
-        return "pressed Enter in search box";
+    for (const sel of buttonSelectors) {
+      let all;
+      try {
+        all = frame.locator(sel);
+      } catch {
+        continue;
       }
-    } catch {
-      // keep trying other frames
+      const n = await all.count().catch(() => 0);
+      for (let i = 0; i < n; i++) {
+        const el = all.nth(i);
+        try {
+          if (await el.isVisible()) {
+            await el.scrollIntoViewIfNeeded().catch(() => {});
+            await el.click({ timeout: 4000 });
+            return `clicked ${sel}`;
+          }
+        } catch {
+          // keep trying
+        }
+      }
     }
   }
 
+  // 3) Nothing matched — dump the page's controls so we can target the real one.
+  await dumpControls(page);
   return null;
+}
+
+// Diagnostic: list the inputs/buttons/links in every frame so we can identify
+// the real search control when the heuristics above miss.
+async function dumpControls(page) {
+  log("── diagnostic: controls found on the page ──");
+  for (const frame of page.frames()) {
+    let items;
+    try {
+      items = await frame.evaluate(() => {
+        const out = [];
+        const els = document.querySelectorAll("input, button, a[onclick], a[href], [role='button']");
+        for (const el of els) {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue; // skip hidden
+          out.push({
+            tag: el.tagName.toLowerCase(),
+            type: el.getAttribute("type") || "",
+            id: el.id || "",
+            cls: (el.className || "").toString().slice(0, 60),
+            aria: el.getAttribute("aria-label") || "",
+            title: el.getAttribute("title") || "",
+            text: (el.innerText || el.value || "").trim().slice(0, 40),
+          });
+        }
+        return out.slice(0, 40);
+      });
+    } catch {
+      continue;
+    }
+    if (!items.length) continue;
+    log(`  frame: ${frame.url().slice(0, 80)}`);
+    for (const it of items) {
+      log(
+        `    <${it.tag}${it.type ? " type=" + it.type : ""}>` +
+          ` id="${it.id}" aria="${it.aria}" title="${it.title}"` +
+          ` class="${it.cls}" text="${it.text}"`
+      );
+    }
+  }
+  log("── end diagnostic — paste these lines to me if the search still won't trigger ──");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
