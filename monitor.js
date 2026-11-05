@@ -15,6 +15,13 @@ const CLASSES = ["compsci 189", "eleng 64"];
 const INTERVAL_MS = 1 * 60 * 1000; // 1 minute
 const USER_DATA_DIR = "./.browser-profile"; // persists login between runs
 
+// Also push alerts to your phone via a Telegram bot. Set both env vars:
+//   TELEGRAM_TOKEN="123456:ABC..."  (from @BotFather)
+//   TELEGRAM_CHAT_ID="12345678"     (your chat id, from @userinfobot)
+// Leave either unset to skip Telegram (Mac notification still fires).
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -37,6 +44,30 @@ function notify(title, message) {
   // Also say it out loud + terminal bell so it's hard to miss.
   execFile("say", [message], () => {});
   process.stdout.write("\u0007");
+  // And push to your phone via Telegram, if configured.
+  pushTelegram(`${title} — ${message}`);
+}
+
+// Send a Telegram message via your bot. No-op unless both env vars are set.
+// Telegram isn't IP-rate-limited like ntfy, so it works on shared campus WiFi.
+async function pushTelegram(text) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }),
+      }
+    );
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      log(`(Telegram push failed: HTTP ${res.status} ${body.slice(0, 150)})`);
+    }
+  } catch (e) {
+    log(`(Telegram push error: ${e.message})`);
+  }
 }
 
 function waitForEnter(promptText) {
