@@ -15,6 +15,11 @@ const CLASSES = ["compsci 189", "eleng 64"];
 const INTERVAL_MS = 1 * 60 * 1000; // 1 minute
 const USER_DATA_DIR = "./.browser-profile"; // persists login between runs
 
+// Also text yourself via iMessage. Set your phone number or Apple ID email in
+// the IMESSAGE_TO env var, e.g.  IMESSAGE_TO="+15105551234" node monitor.js
+// Leave it unset to skip phone notifications (Mac notification still fires).
+const IMESSAGE_TO = process.env.IMESSAGE_TO || "";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -37,6 +42,24 @@ function notify(title, message) {
   // Also say it out loud + terminal bell so it's hard to miss.
   execFile("say", [message], () => {});
   process.stdout.write("\u0007");
+  // And push to your phone via iMessage, if a recipient is configured.
+  pushPhone(`${title} — ${message}`);
+}
+
+// Send an iMessage to yourself (phone # or Apple ID in IMESSAGE_TO). No-op if
+// unset. Requires Messages signed in on this Mac and Automation permission
+// (you'll be prompted to Allow on the first send).
+function pushPhone(text) {
+  if (!IMESSAGE_TO) return;
+  const script =
+    `tell application "Messages"\n` +
+    `  send ${JSON.stringify(text)} to buddy ${JSON.stringify(
+      IMESSAGE_TO
+    )} of (1st service whose service type is iMessage)\n` +
+    `end tell`;
+  execFile("osascript", ["-e", script], (err) => {
+    if (err) log(`(iMessage push failed: ${err.message})`);
+  });
 }
 
 function waitForEnter(promptText) {
