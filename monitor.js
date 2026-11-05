@@ -10,7 +10,7 @@ const URL =
 
 // The classes to watch — one tab each, all in one browser with a single login.
 // Type them exactly as you'd type into the Class Search box. Add/remove freely.
-const CLASSES = ["compsci 189", "eleng 64"];
+const CLASSES = ["compsci 189", "philos r1b", "eleng 64"];
 
 const INTERVAL_MS = 1 * 60 * 1000; // 1 minute
 const USER_DATA_DIR = "./.browser-profile"; // persists login between runs
