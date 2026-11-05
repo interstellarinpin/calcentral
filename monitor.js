@@ -8,7 +8,11 @@ import { execFile } from "node:child_process";
 const URL =
   "https://bcsweb.is.berkeley.edu/psc/bcsprd/EMPLOYEE/SA/c/SSR_STUDENT_FL.SSR_MD_SP_FL.GBL?Action=U&MD=Y&GMenu=SSR_STUDENT_FL&GComp=SSR_START_PAGE_FL&GPage=SSR_START_PAGE_FL&scname=CS_SSR_MANAGE_CLASSES_NAV&AJAXTransfer=y&ICAJAXTrf=true&ICMDListSlideout=true&backTo=academics";
 
-const INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+// The classes to watch — one tab each, all in one browser with a single login.
+// Type them exactly as you'd type into the Class Search box. Add/remove freely.
+const CLASSES = ["compsci 189", "eleng 64"];
+
+const INTERVAL_MS = 1 * 60 * 1000; // 1 minute
 const USER_DATA_DIR = "./.browser-profile"; // persists login between runs
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +143,35 @@ export async function clickSearch(page) {
   return null;
 }
 
+// Type a class name into the keyword box and submit, so the script (not the
+// user) controls which class lands in which tab. Returns true if it searched.
+export async function searchFor(page, query) {
+  const editableInputs =
+    'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="image"])';
+  for (const frame of page.frames()) {
+    let inputs;
+    try {
+      inputs = frame.locator(editableInputs);
+    } catch {
+      continue;
+    }
+    const n = await inputs.count().catch(() => 0);
+    for (let i = 0; i < n; i++) {
+      const el = inputs.nth(i);
+      try {
+        if ((await el.isVisible()) && (await el.isEditable())) {
+          await el.fill(query);
+          await el.press("Enter");
+          return true;
+        }
+      } catch {
+        // not the keyword box — keep scanning
+      }
+    }
+  }
+  return false;
+}
+
 // Diagnostic: list the inputs/buttons/links in every frame so we can identify
 // the real search control when the heuristics above miss.
 async function dumpControls(page) {
@@ -184,6 +217,11 @@ async function dumpControls(page) {
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
 async function main() {
+  if (CLASSES.length === 0) {
+    log("No classes configured. Add some to the CLASSES list at the top.");
+    process.exit(1);
+  }
+
   log("Launching browser…");
   const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: false,
@@ -191,68 +229,106 @@ async function main() {
     args: ["--start-maximized"],
   });
 
-  const page = context.pages()[0] || (await context.newPage());
-
-  log("Opening the class page. Logging in is up to you.");
-  await page.goto(URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+  // Log in once. The login is shared across every tab in this browser.
+  const loginPage = context.pages()[0] || (await context.newPage());
+  await loginPage.goto(URL, { waitUntil: "domcontentloaded" }).catch(() => {});
 
   console.log("\n==============================================================");
-  console.log(" 1. Log in and navigate until the  Open: <number>  is visible");
-  console.log(" 2. Then come back here and press ENTER to start monitoring");
+  console.log(` Watching ${CLASSES.length} class(es): ${CLASSES.join(", ")}`);
+  console.log(" 1. Log in in the browser window (just once)");
+  console.log(" 2. Get to the Class Search page (the search box on screen)");
+  console.log(" 3. Come back here and press ENTER");
   console.log("==============================================================\n");
-  await waitForEnter("Press ENTER once the Open count is on screen… ");
+  await waitForEnter("Press ENTER once you're logged in and on Class Search… ");
 
-  let current = await readOpenValue(page);
-  if (current === null) {
-    console.log(
-      "\n⚠️  Couldn't find 'Open:' on the page right now.\n" +
-        "    Make sure the number is visible, then press ENTER to try again."
-    );
-    await waitForEnter("Press ENTER to retry… ");
-    current = await readOpenValue(page);
+  // One tab per class: navigate, auto-search that class, read its baseline.
+  const watches = [];
+  for (let i = 0; i < CLASSES.length; i++) {
+    const query = CLASSES[i];
+    const page = i === 0 ? loginPage : await context.newPage();
+
+    if (i !== 0) {
+      await page.goto(URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(2000);
+    }
+
+    log(`Searching "${query}"…`);
+    const searched = await searchFor(page, query);
+    if (!searched) {
+      log(`  Couldn't find the search box for "${query}" automatically.`);
+    }
+    await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(3000);
+
+    let value = await readOpenValue(page);
+    if (value === null) {
+      console.log(
+        `\n⚠️  Couldn't read the Open count for "${query}".\n` +
+          `    In that tab, search "${query}" so its Open number is visible,\n` +
+          `    then press ENTER to try this class again.`
+      );
+      await waitForEnter("Press ENTER to retry… ");
+      value = await readOpenValue(page);
+    }
+
+    if (value === null) {
+      log(`  Skipping "${query}" — still can't read its Open count.`);
+      continue;
+    }
+
+    log(`  Baseline for "${query}": Open = ${value}`);
+    watches.push({ query, page, current: value });
   }
 
-  if (current === null) {
-    log("Still can't read the Open value. Exiting so you can check the page.");
+  if (watches.length === 0) {
+    log("No classes could be read. Exiting so you can check the page.");
     await context.close();
     process.exit(1);
   }
 
-  log(`Baseline Open value: ${current}. Checking every 5 minutes.`);
-  notify("Monitoring started", `Open is currently ${current}`);
+  log(
+    `Monitoring ${watches.length} class(es) every minute: ` +
+      watches.map((w) => `${w.query}=${w.current}`).join(", ")
+  );
+  notify(
+    "Monitoring started",
+    watches.map((w) => `${w.query}: ${w.current}`).join(", ")
+  );
 
   // ───────────────────────────── Poll loop ─────────────────────────────
   while (true) {
     await new Promise((r) => setTimeout(r, INTERVAL_MS));
 
-    const how = await clickSearch(page);
-    if (how === null) {
-      log("Couldn't find the search button this cycle. Will retry next cycle.");
-      continue;
-    }
-    log(`Re-ran search (${how}).`);
+    for (const w of watches) {
+      const how = await clickSearch(w.page);
+      if (how === null) {
+        log(`[${w.query}] Couldn't re-run the search this cycle. Will retry.`);
+        continue;
+      }
 
-    // Give PeopleSoft's async rendering a moment to settle after the search.
-    await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(3000);
+      await w.page
+        .waitForLoadState("networkidle", { timeout: 30000 })
+        .catch(() => {});
+      await w.page.waitForTimeout(3000);
 
-    const value = await readOpenValue(page);
+      const value = await readOpenValue(w.page);
 
-    if (value === null) {
-      log("Could not read Open value this cycle (session may have expired?).");
-      notify(
-        "Monitor can't read the page",
-        "The Open count wasn't found — you may need to log in again."
-      );
-      continue;
-    }
+      if (value === null) {
+        log(`[${w.query}] Could not read Open value (session may have expired?).`);
+        notify(
+          `Can't read ${w.query}`,
+          "The Open count wasn't found — you may need to log in again."
+        );
+        continue;
+      }
 
-    if (value !== current) {
-      log(`⚡ CHANGED: Open went from ${current} → ${value}`);
-      notify("Open count changed!", `${current} → ${value}`);
-      current = value;
-    } else {
-      log(`No change. Open = ${value}`);
+      if (value !== w.current) {
+        log(`[${w.query}] ⚡ CHANGED: Open ${w.current} → ${value}`);
+        notify(`${w.query} changed!`, `Open ${w.current} → ${value}`);
+        w.current = value;
+      } else {
+        log(`[${w.query}] No change. Open = ${value}`);
+      }
     }
   }
 }
