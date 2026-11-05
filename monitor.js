@@ -69,6 +69,35 @@ export async function readOpenValue(page) {
   return null;
 }
 
+// Normalize a class id for loose matching: "compsci 189" -> "COMPSCI189",
+// so it matches the page's "COMPSCI 189: Introduction To Machine Learning".
+export function normId(s) {
+  return String(s).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+// Find which open tab is showing a given class, and read its Open count.
+// We match by the class name appearing in the page text, so the label always
+// follows the actual tab content — no reliance on tab order. Returns the page
+// and value, or null if no tab currently shows that class with an Open count.
+export async function findClassTab(pages, query) {
+  const want = normId(query);
+  for (const page of pages) {
+    for (const frame of page.frames()) {
+      let text;
+      try {
+        text = await frame.evaluate(() => document.body?.innerText || "");
+      } catch {
+        continue;
+      }
+      if (normId(text).includes(want)) {
+        const m = text.match(/Open:\s*(\d+)/i);
+        if (m) return { page, value: m[1] };
+      }
+    }
+  }
+  return null;
+}
+
 // Re-run the class search. A full page reload loses PeopleSoft's search results,
 // so instead we re-trigger the search in place. PeopleSoft's keyword search submits
 // when you press Enter in the box, which is the most reliable path, so we try that
@@ -229,55 +258,56 @@ async function main() {
     args: ["--start-maximized"],
   });
 
-  // Log in once. The login is shared across every tab in this browser.
-  const loginPage = context.pages()[0] || (await context.newPage());
-  await loginPage.goto(URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+  // Open one tab per class up front (login is shared across all of them).
+  // We don't auto-navigate to the search box because PeopleSoft doesn't land
+  // there reliably — you search each class yourself, then we match each tab to
+  // its class by reading the page, so labels are always correct.
+  const tabs = [];
+  for (let i = 0; i < CLASSES.length; i++) {
+    const page = i === 0 ? context.pages()[0] || (await context.newPage()) : await context.newPage();
+    await page.goto(URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.bringToFront().catch(() => {});
+    tabs.push(page);
+  }
 
   console.log("\n==============================================================");
   console.log(` Watching ${CLASSES.length} class(es): ${CLASSES.join(", ")}`);
-  console.log(" 1. Log in in the browser window (just once)");
-  console.log(" 2. Get to the Class Search page (the search box on screen)");
+  console.log(` I opened ${CLASSES.length} tab(s) in the browser.`);
+  console.log(" 1. Log in (just once — all tabs share it)");
+  console.log(" 2. In the tabs, search ONE class each so its Open count shows:");
+  for (const c of CLASSES) console.log(`       • ${c}`);
   console.log(" 3. Come back here and press ENTER");
+  console.log(" (Tab order doesn't matter — I match each tab to its class.)");
   console.log("==============================================================\n");
-  await waitForEnter("Press ENTER once you're logged in and on Class Search… ");
+  await waitForEnter("Press ENTER once every class's Open count is on screen… ");
 
-  // One tab per class: navigate, auto-search that class, read its baseline.
+  // Match each class to whichever tab is showing it.
   const watches = [];
-  for (let i = 0; i < CLASSES.length; i++) {
-    const query = CLASSES[i];
-    const page = i === 0 ? loginPage : await context.newPage();
-
-    if (i !== 0) {
-      await page.goto(URL, { waitUntil: "domcontentloaded" }).catch(() => {});
-      await page.waitForTimeout(2000);
-    }
-
-    log(`Searching "${query}"…`);
-    const searched = await searchFor(page, query);
-    if (!searched) {
-      log(`  Couldn't find the search box for "${query}" automatically.`);
-    }
-    await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(3000);
-
-    let value = await readOpenValue(page);
-    if (value === null) {
+  let pending = [...CLASSES];
+  for (let attempt = 0; attempt < 2 && pending.length > 0; attempt++) {
+    if (attempt > 0) {
       console.log(
-        `\n⚠️  Couldn't read the Open count for "${query}".\n` +
-          `    In that tab, search "${query}" so its Open number is visible,\n` +
-          `    then press ENTER to try this class again.`
+        `\n⚠️  Couldn't find: ${pending.join(", ")}\n` +
+          "    Search each of those in a tab so its Open count is visible,\n" +
+          "    then press ENTER to retry (or Ctrl+C to give up on them)."
       );
-      await waitForEnter("Press ENTER to retry… ");
-      value = await readOpenValue(page);
+      await waitForEnter("Press ENTER to retry the missing class(es)… ");
     }
-
-    if (value === null) {
-      log(`  Skipping "${query}" — still can't read its Open count.`);
-      continue;
+    const stillMissing = [];
+    for (const query of pending) {
+      const hit = await findClassTab(context.pages(), query);
+      if (hit) {
+        log(`  Baseline for "${query}": Open = ${hit.value}`);
+        watches.push({ query, page: hit.page, current: hit.value });
+      } else {
+        stillMissing.push(query);
+      }
     }
+    pending = stillMissing;
+  }
 
-    log(`  Baseline for "${query}": Open = ${value}`);
-    watches.push({ query, page, current: value });
+  if (pending.length > 0) {
+    log(`Giving up on: ${pending.join(", ")} (couldn't find them in any tab).`);
   }
 
   if (watches.length === 0) {
