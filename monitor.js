@@ -10,15 +10,22 @@ const URL =
 
 // The classes to watch — one tab each, all in one browser with a single login.
 // Type them exactly as you'd type into the Class Search box. Add/remove freely.
-const CLASSES = ["compsci 189", "philos r1b", "eleng 64"];
+const CLASSES = ["physics 5b", "physics 5bl", "physics 89"];
+
+// Sections to ignore even if a search returns them (searches sometimes pull in
+// unrelated courses). Matched loosely against each section's label, so
+// "physics 110a" drops "PHYSICS 110A: …" no matter the component/number.
+const EXCLUDE = ["physics 110a"];
 
 const INTERVAL_MS = 1 * 60 * 1000; // 1 minute
 const USER_DATA_DIR = "./.browser-profile"; // persists login between runs
 
-// Also push alerts to your phone via a Telegram bot. Set both env vars:
-//   TELEGRAM_TOKEN="123456:ABC..."  (from @BotFather)
-//   TELEGRAM_CHAT_ID="12345678"     (your chat id, from @userinfobot)
-// Leave either unset to skip Telegram (Mac notification still fires).
+// Also push alerts to one or more phones via a Telegram bot. Set both env vars:
+//   TELEGRAM_TOKEN="123456:ABC..."     (from @BotFather)
+//   TELEGRAM_CHAT_ID="12345678"        (your chat id, from @userinfobot)
+// For multiple phones, comma-separate the IDs: TELEGRAM_CHAT_ID="111,222"
+// Each recipient must have tapped Start on the bot first. Leave either unset to
+// skip Telegram (Mac notification still fires).
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
@@ -52,21 +59,24 @@ function notify(title, message) {
 // Telegram isn't IP-rate-limited like ntfy, so it works on shared campus WiFi.
 async function pushTelegram(text) {
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
-  try {
-    const res = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text }),
+  const ids = TELEGRAM_CHAT_ID.split(",").map((s) => s.trim()).filter(Boolean);
+  for (const id of ids) {
+    try {
+      const res = await fetch(
+        `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: id, text }),
+        }
+      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        log(`(Telegram push to ${id} failed: HTTP ${res.status} ${body.slice(0, 150)})`);
       }
-    );
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      log(`(Telegram push failed: HTTP ${res.status} ${body.slice(0, 150)})`);
+    } catch (e) {
+      log(`(Telegram push to ${id} error: ${e.message})`);
     }
-  } catch (e) {
-    log(`(Telegram push error: ${e.message})`);
   }
 }
 
@@ -98,6 +108,83 @@ export async function readOpenValue(page) {
     if (match) return match[1];
   }
   return null;
+}
+
+// Parse EVERY section on a results page from its text. A search like
+// "physics 5b" returns multiple sections (PHYSICS 5B plus several 5BL labs),
+// each with its own "Open: N". We split the text into per-section blocks that
+// start at a course header ("PHYSICS 5B: …", "PHYSICS 5BL: …") and pull out the
+// section component ("LEC 001 #22702") and its Open count. The class number
+// (#22702) is a stable unique key per section.
+export function parseOpenSections(text) {
+  const headerRe = /^([A-Z][A-Z&]*(?:\s+[A-Z&]+)*\s+\d+[A-Z]*):\s*(.+)$/;
+  const compRe = /^(LEC|LAB|DIS|SEM|STU|FLD|IND|REC|GRP|TUT|WOR|COL)\s+(\d+)\s+#(\d+)/;
+  const openRe = /Open:\s*(\d+)/i;
+  // Waitlist count, written various ways by PeopleSoft:
+  // "Waitlist: 5", "Wait List 5", "Waitlisted: 5", "Wait-list total 5".
+  const waitRe = /wait\s*-?\s*list(?:ed)?(?:\s+total)?[:\s]+(\d+)/i;
+
+  const sections = [];
+  let cur = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    const h = line.match(headerRe);
+    if (h) {
+      cur = { course: h[1].replace(/\s+/g, " "), comp: null, num: null, open: null, wait: null };
+      sections.push(cur);
+      continue;
+    }
+    if (!cur) continue;
+    const c = line.match(compRe);
+    if (c && !cur.comp) {
+      cur.comp = `${c[1]} ${c[2]}`;
+      cur.num = c[3];
+      continue;
+    }
+    const o = line.match(openRe);
+    if (o && cur.open === null) {
+      cur.open = o[1];
+      continue;
+    }
+    const w = line.match(waitRe);
+    if (w && cur.wait === null) cur.wait = w[1];
+  }
+
+  return sections
+    .filter((s) => s.open !== null)
+    .map((s) => ({
+      id: s.num || `${s.course} ${s.comp || ""}`.trim(),
+      label: [s.course, s.comp, s.num ? `#${s.num}` : ""].filter(Boolean).join(" "),
+      open: s.open,
+      wait: s.wait, // may be null if the page didn't show a waitlist count
+    }));
+}
+
+// True if a section matches the EXCLUDE list (e.g. physics 110A), so searches
+// that pull in unrelated courses don't get watched.
+export function isExcluded(section) {
+  const label = normId(section.label);
+  return EXCLUDE.some((e) => label.includes(normId(e)));
+}
+
+// Read every section (across all frames) of a results page into a Map keyed by
+// the stable class number, so overlapping tabs (e.g. "physics 5b" and
+// "physics 5bl" both show the labs) naturally dedupe.
+export async function readAllSections(page) {
+  const map = new Map();
+  for (const frame of page.frames()) {
+    let text;
+    try {
+      text = await frame.evaluate(() => document.body?.innerText || "");
+    } catch {
+      continue;
+    }
+    for (const s of parseOpenSections(text)) {
+      if (isExcluded(s)) continue;
+      map.set(s.id, s);
+    }
+  }
+  return map;
 }
 
 // Normalize a class id for loose matching: "compsci 189" -> "COMPSCI189",
@@ -302,95 +389,98 @@ async function main() {
   }
 
   console.log("\n==============================================================");
-  console.log(` Watching ${CLASSES.length} class(es): ${CLASSES.join(", ")}`);
+  console.log(` Watching searches: ${CLASSES.join(", ")}`);
   console.log(` I opened ${CLASSES.length} tab(s) in the browser.`);
   console.log(" 1. Log in (just once — all tabs share it)");
-  console.log(" 2. In the tabs, search ONE class each so its Open count shows:");
+  console.log(" 2. In the tabs, run ONE of these searches each:");
   for (const c of CLASSES) console.log(`       • ${c}`);
+  console.log("    (so the results with their Open counts are on screen)");
   console.log(" 3. Come back here and press ENTER");
-  console.log(" (Tab order doesn't matter — I match each tab to its class.)");
+  console.log(" (Tab order doesn't matter — I read every section on each page.)");
   console.log("==============================================================\n");
-  await waitForEnter("Press ENTER once every class's Open count is on screen… ");
+  await waitForEnter("Press ENTER once every search's results are on screen… ");
 
-  // Match each class to whichever tab is showing it.
-  const watches = [];
-  let pending = [...CLASSES];
-  for (let attempt = 0; attempt < 2 && pending.length > 0; attempt++) {
-    if (attempt > 0) {
-      console.log(
-        `\n⚠️  Couldn't find: ${pending.join(", ")}\n` +
-          "    Search each of those in a tab so its Open count is visible,\n" +
-          "    then press ENTER to retry (or Ctrl+C to give up on them)."
-      );
-      await waitForEnter("Press ENTER to retry the missing class(es)… ");
+  // Read every section across all tabs into one map (class number -> section),
+  // deduped so overlapping searches don't double-count.
+  async function snapshot() {
+    const all = new Map();
+    for (const page of tabs) {
+      const secs = await readAllSections(page);
+      for (const [id, s] of secs) all.set(id, s);
     }
-    const stillMissing = [];
-    for (const query of pending) {
-      const hit = await findClassTab(context.pages(), query);
-      if (hit) {
-        log(`  Baseline for "${query}": Open = ${hit.value}`);
-        watches.push({ query, page: hit.page, current: hit.value });
-      } else {
-        stillMissing.push(query);
-      }
-    }
-    pending = stillMissing;
+    return all;
   }
 
-  if (pending.length > 0) {
-    log(`Giving up on: ${pending.join(", ")} (couldn't find them in any tab).`);
+  let baseline = await snapshot();
+  if (baseline.size === 0) {
+    console.log(
+      "\n⚠️  Couldn't read any sections. Make sure each search's results are\n" +
+        "    visible (with their Open counts), then press ENTER to retry."
+    );
+    await waitForEnter("Press ENTER to retry… ");
+    baseline = await snapshot();
   }
 
-  if (watches.length === 0) {
-    log("No classes could be read. Exiting so you can check the page.");
+  if (baseline.size === 0) {
+    log("Still no sections readable. Exiting so you can check the page.");
     await context.close();
     process.exit(1);
   }
 
-  log(
-    `Monitoring ${watches.length} class(es) every minute: ` +
-      watches.map((w) => `${w.query}=${w.current}`).join(", ")
-  );
+  const wl = (s) => (s.wait === null ? "n/a" : s.wait);
+  log(`Monitoring ${baseline.size} section(s) every minute:`);
+  for (const s of baseline.values())
+    log(`  • ${s.label}: Open = ${s.open}, Waitlist = ${wl(s)}`);
   notify(
     "Monitoring started",
-    watches.map((w) => `${w.query}: ${w.current}`).join(", ")
+    [...baseline.values()].map((s) => `${s.label}: Open ${s.open}, WL ${wl(s)}`).join("\n")
   );
 
   // ───────────────────────────── Poll loop ─────────────────────────────
   while (true) {
     await new Promise((r) => setTimeout(r, INTERVAL_MS));
 
-    for (const w of watches) {
-      const how = await clickSearch(w.page);
-      if (how === null) {
-        log(`[${w.query}] Couldn't re-run the search this cycle. Will retry.`);
+    // Re-run every tab's search, then read a fresh snapshot of all sections.
+    for (const page of tabs) {
+      const how = await clickSearch(page);
+      if (how === null) continue; // couldn't re-run this tab; others may still work
+      await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
+      await page.waitForTimeout(3000);
+    }
+
+    const now = await snapshot();
+
+    if (now.size === 0) {
+      log("Could not read any sections this cycle (session may have expired?).");
+      notify(
+        "Monitor can't read the page",
+        "No Open counts found — you may need to log in again."
+      );
+      continue;
+    }
+
+    let anyChange = false;
+    for (const [id, s] of now) {
+      const prev = baseline.get(id);
+      if (!prev) {
+        log(`➕ New section appeared: ${s.label}: Open = ${s.open}, Waitlist = ${wl(s)}`);
+        baseline.set(id, s);
         continue;
       }
-
-      await w.page
-        .waitForLoadState("networkidle", { timeout: 30000 })
-        .catch(() => {});
-      await w.page.waitForTimeout(3000);
-
-      const value = await readOpenValue(w.page);
-
-      if (value === null) {
-        log(`[${w.query}] Could not read Open value (session may have expired?).`);
-        notify(
-          `Can't read ${w.query}`,
-          "The Open count wasn't found — you may need to log in again."
-        );
-        continue;
-      }
-
-      if (value !== w.current) {
-        log(`[${w.query}] ⚡ CHANGED: Open ${w.current} → ${value}`);
-        notify(`${w.query} changed!`, `Open ${w.current} → ${value}`);
-        w.current = value;
-      } else {
-        log(`[${w.query}] No change. Open = ${value}`);
+      const openChanged = s.open !== prev.open;
+      const waitChanged = s.wait !== prev.wait;
+      if (openChanged || waitChanged) {
+        anyChange = true;
+        const parts = [];
+        if (openChanged) parts.push(`Open ${prev.open} → ${s.open}`);
+        if (waitChanged) parts.push(`Waitlist ${wl(prev)} → ${wl(s)}`);
+        const detail = parts.join("\n");
+        log(`⚡ CHANGED: ${s.label}: ${parts.join(", ")}`);
+        notify(`${s.label} — ${openChanged ? "seats changed!" : "waitlist changed"}`, detail);
+        baseline.set(id, s);
       }
     }
+    if (!anyChange) log(`No change across ${now.size} section(s).`);
   }
 }
 
