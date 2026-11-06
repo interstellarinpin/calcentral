@@ -123,9 +123,11 @@ export function parseOpenSections(text) {
   const headerRe = /^([A-Z][A-Z&]*(?:\s+[A-Z&]+)*\s+\d+[A-Z]*):\s*(.+)$/;
   const compRe = /^(LEC|LAB|DIS|SEM|STU|FLD|IND|REC|GRP|TUT|WOR|COL)\s+(\d+)\s+#(\d+)/;
   const openRe = /Open:\s*(\d+)/i;
-  // Waitlist count, written various ways by PeopleSoft:
-  // "Waitlist: 5", "Wait List 5", "Waitlisted: 5", "Wait-list total 5".
-  const waitRe = /wait\s*-?\s*list(?:ed)?(?:\s+total)?[:\s]+(\d+)/i;
+  // Waitlist, written various ways by PeopleSoft: "Waitlist: 5", "Wait List 5",
+  // "Waitlisted: 10 / 10" (people waiting / waitlist capacity). We grab both
+  // numbers when present and keep them as "10 / 10", so a change in EITHER
+  // (e.g. 10 / 10 -> 9 / 10 when someone drops) counts as a change.
+  const waitRe = /wait\s*-?\s*list(?:ed)?(?:\s+total)?[:\s]+(\d+)(?:\s*\/\s*(\d+))?/i;
 
   const sections = [];
   let cur = null;
@@ -150,7 +152,7 @@ export function parseOpenSections(text) {
       continue;
     }
     const w = line.match(waitRe);
-    if (w && cur.wait === null) cur.wait = w[1];
+    if (w && cur.wait === null) cur.wait = w[2] ? `${w[1]} / ${w[2]}` : w[1];
   }
 
   return sections
