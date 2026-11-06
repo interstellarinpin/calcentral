@@ -40,8 +40,10 @@ function log(msg) {
   console.log(`[${ts()}] ${msg}`);
 }
 
-// macOS desktop notification + sound
-function notify(title, message) {
+// macOS desktop notification + sound. Pass { push: false } for local-only
+// messages (startup summary, errors) so they DON'T ping anyone's phone —
+// Telegram should only fire on real seat/waitlist changes.
+function notify(title, message, { push = true } = {}) {
   const script = `display notification ${JSON.stringify(
     message
   )} with title ${JSON.stringify(title)} sound name "Glass"`;
@@ -51,8 +53,9 @@ function notify(title, message) {
   // Also say it out loud + terminal bell so it's hard to miss.
   execFile("say", [message], () => {});
   process.stdout.write("\u0007");
-  // And push to your phone via Telegram, if configured.
-  pushTelegram(`${title} — ${message}`);
+  // And push to your (and your friend's) phone via Telegram, if configured —
+  // but only for real changes, not startup/error noise.
+  if (push) pushTelegram(`${title} — ${message}`);
 }
 
 // Send a Telegram message via your bot. No-op unless both env vars are set.
@@ -285,8 +288,8 @@ export async function clickSearch(page) {
     }
   }
 
-  // 3) Nothing matched — dump the page's controls so we can target the real one.
-  await dumpControls(page);
+  // 3) Nothing matched this cycle (usually the page was mid-render). Stay quiet
+  //    and let the caller decide whether to dump diagnostics after repeated misses.
   return null;
 }
 
@@ -433,17 +436,33 @@ async function main() {
     log(`  • ${s.label}: Open = ${s.open}, Waitlist = ${wl(s)}`);
   notify(
     "Monitoring started",
-    [...baseline.values()].map((s) => `${s.label}: Open ${s.open}, WL ${wl(s)}`).join("\n")
+    [...baseline.values()].map((s) => `${s.label}: Open ${s.open}, WL ${wl(s)}`).join("\n"),
+    { push: false } // local only — don't ping phones just because you restarted
   );
 
   // ───────────────────────────── Poll loop ─────────────────────────────
+  // A tab occasionally can't be re-searched for one cycle (page mid-render).
+  // That's harmless and self-corrects, so we just log a one-liner. Only if a tab
+  // misses several cycles in a row do we dump its controls once, to help debug.
+  const DUMP_AFTER = 3;
+  const searchFails = new Map();
   while (true) {
     await new Promise((r) => setTimeout(r, INTERVAL_MS));
 
     // Re-run every tab's search, then read a fresh snapshot of all sections.
     for (const page of tabs) {
       const how = await clickSearch(page);
-      if (how === null) continue; // couldn't re-run this tab; others may still work
+      if (how === null) {
+        const n = (searchFails.get(page) || 0) + 1;
+        searchFails.set(page, n);
+        log(`Couldn't re-run a search this cycle (miss ${n}); retrying next minute.`);
+        if (n === DUMP_AFTER) {
+          log(`A tab has missed ${n} cycles in a row — dumping its controls once:`);
+          await dumpControls(page);
+        }
+        continue; // others may still work
+      }
+      searchFails.set(page, 0); // recovered — reset its miss counter
       await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(3000);
     }
@@ -454,7 +473,8 @@ async function main() {
       log("Could not read any sections this cycle (session may have expired?).");
       notify(
         "Monitor can't read the page",
-        "No Open counts found — you may need to log in again."
+        "No Open counts found — you may need to log in again.",
+        { push: false } // local only — a login hiccup isn't your friend's problem
       );
       continue;
     }
