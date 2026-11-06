@@ -227,12 +227,18 @@ export async function findClassTab(pages, query) {
 // first, then fall back to clicking a magnifying-glass / search button. We scan
 // every frame since the content lives in nested iframes.
 export async function clickSearch(page) {
-  // 1) Press Enter in the visible keyword box. We can't use input[type="text"]
-  //    alone — PeopleSoft inputs often have NO type attribute (so they default to
-  //    text but don't match [type=text]). Enumerate real matches and pick a
-  //    visible, editable one rather than blindly taking .first() (often hidden).
+  // 1) Press Enter in the real class-search keyword box. Two gotchas:
+  //    (a) PeopleSoft inputs often have NO type attribute, so they don't match
+  //        input[type=text]; and
+  //    (b) the page ALSO has a "Filter Subjects" box in the left sidebar — we must
+  //        NOT type/Enter into that by mistake (that's what was flashing).
+  //    So we skip any filter/subject field and PREFER the input that already holds
+  //    the query text (the keyword box keeps "physics 5b" in it across refreshes).
   const editableInputs =
     'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="image"])';
+  const looksLikeFilter = (s) => /filter|subject/i.test(s || "");
+
+  const candidates = [];
   for (const frame of page.frames()) {
     let inputs;
     try {
@@ -244,14 +250,31 @@ export async function clickSearch(page) {
     for (let i = 0; i < n; i++) {
       const el = inputs.nth(i);
       try {
-        if ((await el.isVisible()) && (await el.isEditable())) {
-          await el.click({ timeout: 3000 });
-          await el.press("Enter");
-          return "pressed Enter in keyword box";
-        }
+        if (!(await el.isVisible()) || !(await el.isEditable())) continue;
+        const attrs =
+          ((await el.getAttribute("placeholder")) || "") + " " +
+          ((await el.getAttribute("aria-label")) || "") + " " +
+          ((await el.getAttribute("id")) || "") + " " +
+          ((await el.getAttribute("name")) || "");
+        if (looksLikeFilter(attrs)) continue; // never the Filter Subjects box
+        const value = (await el.inputValue().catch(() => "")) || "";
+        candidates.push({ el, value });
       } catch {
-        // not the right input — keep scanning
+        // not usable — keep scanning
       }
+    }
+  }
+  // Prefer the box that already holds the search text; else the first candidate.
+  const target = candidates.find((c) => c.value.trim()) || candidates[0];
+  if (target) {
+    try {
+      await target.el.click({ timeout: 3000 });
+      await target.el.press("Enter");
+      return target.value.trim()
+        ? `pressed Enter in keyword box ("${target.value.trim()}")`
+        : "pressed Enter in keyword box";
+    } catch {
+      // fall through to the button path below
     }
   }
 
