@@ -452,6 +452,8 @@ async function main() {
     await new Promise((r) => setTimeout(r, INTERVAL_MS));
 
     // Re-run every tab's search, then read a fresh snapshot of all sections.
+    let searched = 0;
+    const methods = new Set();
     for (const page of tabs) {
       const how = await clickSearch(page);
       if (how === null) {
@@ -464,10 +466,18 @@ async function main() {
         }
         continue; // others may still work
       }
+      searched++;
+      methods.add(how);
       searchFails.set(page, 0); // recovered — reset its miss counter
       await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(3000);
     }
+    // Proof it actually re-triggered the search this cycle (not reading a stale page).
+    log(
+      `Re-ran the search on ${searched}/${tabs.length} tab(s)` +
+        (methods.size ? ` (${[...methods].join("; ")})` : "") +
+        "."
+    );
 
     const now = await snapshot();
 
