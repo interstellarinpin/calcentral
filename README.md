@@ -33,13 +33,14 @@ which is how PeopleSoft re-runs a search. (Finding that box is fiddly: the input
 have no `type` attribute, so a naive `input[type=text]` selector misses them.)
 
 **4. Parsing — the clever bit.**
-One search like `physics 5b` returns *several* sections (the lecture plus a bunch
-of lab sections). `parseOpenSections` splits the page text into per-section
-blocks: each starts with a header like `PHYSICS 5B:`, followed by a component
-line (`LEC 001 #22702`), an `Open: N`, and a waitlist count. The `#22702` class
-number is a unique ID, so when two searches overlap and show the same section, a
-`Map` keyed by that number automatically de-duplicates them. An `EXCLUDE` list
-drops unwanted results that a search pulls in (e.g. `PHYSICS 110A`).
+A single search for any course (say `compsci 189` or `physics 5b`) can return
+*several* sections — a lecture plus its discussion/lab sections.
+`parseOpenSections` splits the page text into per-section blocks: each starts
+with a course header (e.g. `COMPSCI 189:`), followed by a component line
+(`LEC 001 #26152`), an `Open: N`, and a waitlist count. The class number
+(`#26152`) is a unique ID, so when two searches overlap and show the same
+section, a `Map` keyed by that number automatically de-duplicates them. An
+`EXCLUDE` list drops any unrelated result a search happens to pull in.
 
 **5. Change detection + alerts.**
 It keeps a baseline snapshot of every section's Open/Waitlist. Each cycle it
@@ -65,17 +66,19 @@ npx playwright install chromium
 
 ### Pick your classes
 
-Open [`monitor.js`](monitor.js) and edit the `CLASSES` list near the top — type
-each class exactly as you'd type it into the Class Search box:
+Open [`monitor.js`](monitor.js) and edit the `CLASSES` list near the top. Put in
+**any** courses you want to watch — any subject, any number — typed exactly as
+you'd type them into the Class Search box. For example:
 
 ```js
-const CLASSES = ["physics 5b", "physics 5bl", "physics 89"];
+const CLASSES = ["compsci 189", "math 54", "physics 5b"];
 ```
 
-Anything a search pulls in that you *don't* want gets added to `EXCLUDE`:
+It opens one browser tab per entry, so add as many as you like. If a search pulls
+in a course you *don't* want to watch, add it to `EXCLUDE`:
 
 ```js
-const EXCLUDE = ["physics 110a"];
+const EXCLUDE = ["physics 110a"]; // e.g. drop a course a broad search returns
 ```
 
 ### Set up phone notifications (Telegram)
