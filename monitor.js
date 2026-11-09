@@ -10,7 +10,7 @@ const URL =
 
 // The classes to watch — one tab each, all in one browser with a single login.
 // Type them exactly as you'd type into the Class Search box. Add/remove freely.
-const CLASSES = ["physics 5b", "physics 5bl", "physics 89", "philos 12a"];
+const CLASSES = ["physics 5b", "physics 5bl", "physics 89"];
 
 // Sections to ignore even if a search returns them (searches sometimes pull in
 // unrelated courses). Matched loosely against each section's label, so
