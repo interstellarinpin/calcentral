@@ -83,6 +83,27 @@ async function pushTelegram(text) {
   }
 }
 
+// Quick reachability check. We read each page out of the browser's MEMORY every
+// cycle, so if the network is down the last-loaded results just sit there frozen
+// and still parse fine — the script otherwise can't tell "nothing changed" from
+// "I can't reach Berkeley" and would happily log "No change" while blind. So each
+// cycle we test the connection by hitting Berkeley's host directly: ANY HTTP reply
+// (even a 403/404) means we're online; only a network-level failure/timeout means
+// offline.
+const REACH_URL = "https://bcsweb.is.berkeley.edu/";
+async function isOnline() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    await fetch(REACH_URL, { method: "HEAD", signal: ctrl.signal, cache: "no-store" });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function waitForEnter(promptText) {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -471,8 +492,36 @@ async function main() {
   // misses several cycles in a row do we dump its controls once, to help debug.
   const DUMP_AFTER = 3;
   const searchFails = new Map();
+  let offlineStreak = 0;
   while (true) {
     await new Promise((r) => setTimeout(r, INTERVAL_MS));
+
+    // Before trusting anything, make sure we can actually reach Berkeley. If not,
+    // the pages in the browser are frozen at their last-loaded state, so any
+    // "reading" this cycle is STALE. Skip the whole cycle — don't re-search, don't
+    // compare, don't touch the baseline — so being offline can never masquerade as
+    // "No change" (and so the first cycle back online still catches anything that
+    // moved while we were down).
+    if (!(await isOnline())) {
+      offlineStreak++;
+      log(
+        `⚠️  OFFLINE — can't reach Berkeley; readings are STALE, not checking ` +
+          `(offline ${offlineStreak} cycle${offlineStreak === 1 ? "" : "s"}).`
+      );
+      if (offlineStreak === 1) {
+        notify(
+          "Monitor offline",
+          "No connection to Berkeley — the watcher is paused and NOT checking. " +
+            "It resumes automatically when you're back online.",
+          { push: false } // local only — a WiFi drop isn't your friend's problem
+        );
+      }
+      continue;
+    }
+    if (offlineStreak > 0) {
+      log(`✅ Back online after ${offlineStreak} missed cycle(s) — resuming checks.`);
+      offlineStreak = 0;
+    }
 
     // Re-run every tab's search, then read a fresh snapshot of all sections.
     let searched = 0;
