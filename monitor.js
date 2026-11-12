@@ -632,7 +632,13 @@ async function main() {
       }
       const prev = baseline.get(id);
       if (!prev) {
-        log(`➕ New section appeared: ${s.label}: Open = ${s.open}, Waitlist = ${wl(s)}`);
+        // A section we've never seen before just showed up. Every section present at
+        // startup is already in the baseline, so this only fires MID-RUN — meaning a
+        // class that wasn't listed when you started (e.g. physics 5b / 89 while
+        // dropped) has now appeared. That's exactly the signal you want, so ping.
+        anyChange = true;
+        log(`➕ Now showing: ${s.label}: Open = ${s.open}, Waitlist = ${wl(s)}`);
+        notify(`${s.label} — now on the schedule`, `Open ${s.open}, Waitlist ${wl(s)}`);
         baseline.set(id, s);
         continue;
       }
