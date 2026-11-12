@@ -344,6 +344,7 @@ export async function clickSearch(page) {
 export async function searchFor(page, query) {
   const editableInputs =
     'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="image"])';
+  const looksLikeFilter = (s) => /filter|subject/i.test(s || "");
   for (const frame of page.frames()) {
     let inputs;
     try {
@@ -355,17 +356,102 @@ export async function searchFor(page, query) {
     for (let i = 0; i < n; i++) {
       const el = inputs.nth(i);
       try {
-        if ((await el.isVisible()) && (await el.isEditable())) {
-          await el.fill(query);
-          await el.press("Enter");
-          return true;
-        }
+        if (!(await el.isVisible()) || !(await el.isEditable())) continue;
+        const attrs =
+          ((await el.getAttribute("placeholder")) || "") + " " +
+          ((await el.getAttribute("aria-label")) || "") + " " +
+          ((await el.getAttribute("id")) || "") + " " +
+          ((await el.getAttribute("name")) || "");
+        if (looksLikeFilter(attrs)) continue; // never the Filter Subjects box
+        await el.fill(query);
+        await el.press("Enter");
+        return true;
       } catch {
         // not the keyword box — keep scanning
       }
     }
   }
   return false;
+}
+
+// A PeopleSoft tab sometimes dies on a generic error screen ("An error has
+// occurred — Sign in to PeopleSoft — make sure Webserver and Appserver are up"):
+// its per-tab server session hiccupped. The tab is then stuck — no search box —
+// so we detect that page by its text so we can reload and re-search it.
+export async function tabIsBroken(page) {
+  for (const frame of page.frames()) {
+    let text;
+    try {
+      text = await frame.evaluate(() => document.body?.innerText || "");
+    } catch {
+      continue;
+    }
+    if (/an error has occurred|sign in to peoplesoft|webserver and appserver/i.test(text)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Best-effort heal for a broken tab: reload the class-search entry point and re-run
+// that tab's class search. Works when your CalNet login is still alive; if it isn't,
+// the page lands on the sign-in screen and you'll need to log in on that tab by hand.
+async function recoverTab(page, query) {
+  try {
+    await page.goto(URL, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(2000);
+    if (!query) return false;
+    const ok = await searchFor(page, query);
+    await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+// Work out which watched class each tab is showing, so if a tab errors out we can
+// re-search the RIGHT class on it. We match by page content; any class/tab we can't
+// match that way (e.g. a class that's currently unlisted, so its tab shows nothing)
+// is paired up from whatever's left over.
+async function bindTabsToClasses(tabs) {
+  const tabClass = new Map();
+  const taken = new Set();
+  for (const page of tabs) {
+    let matched = null;
+    for (const c of CLASSES) {
+      if (taken.has(c)) continue;
+      let found = false;
+      for (const frame of page.frames()) {
+        let text;
+        try {
+          text = await frame.evaluate(() => document.body?.innerText || "");
+        } catch {
+          continue;
+        }
+        if (normId(text).includes(normId(c))) {
+          found = true;
+          break;
+        }
+      }
+      if (found) {
+        matched = c;
+        break;
+      }
+    }
+    if (matched) {
+      tabClass.set(page, matched);
+      taken.add(matched);
+    }
+  }
+  // Pair leftover tabs with leftover classes (creation order), so an unlisted class
+  // still gets bound to its tab.
+  const leftoverClasses = CLASSES.filter((c) => !taken.has(c));
+  const leftoverTabs = tabs.filter((p) => !tabClass.has(p));
+  for (let i = 0; i < Math.min(leftoverTabs.length, leftoverClasses.length); i++) {
+    tabClass.set(leftoverTabs[i], leftoverClasses[i]);
+  }
+  return tabClass;
 }
 
 // PeopleSoft shows a blocking modal — "The search returns no results that match
@@ -521,6 +607,14 @@ async function main() {
     { push: false } // local only — don't ping phones just because you restarted
   );
 
+  // Remember which tab is showing which class, so a tab that errors out can be
+  // reloaded and re-searched with the right class.
+  const tabClass = await bindTabsToClasses(tabs);
+  for (const [page, c] of tabClass) {
+    const i = tabs.indexOf(page);
+    log(`  tab ${i + 1} → ${c}`);
+  }
+
   // ───────────────────────────── Poll loop ─────────────────────────────
   // A tab occasionally can't be re-searched for one cycle (page mid-render).
   // That's harmless and self-corrects, so we just log a one-liner. Only if a tab
@@ -531,6 +625,8 @@ async function main() {
   // Sections that have dropped out of the results entirely (e.g. a class that got
   // temporarily unlisted). We remember them so we can ping when they come BACK.
   const missing = new Set();
+  // Tabs we've already warned about being stuck on an error page (so we notify once).
+  const brokenNotified = new Map();
   while (true) {
     await new Promise((r) => setTimeout(r, INTERVAL_MS));
 
@@ -565,6 +661,32 @@ async function main() {
     let searched = 0;
     const methods = new Set();
     for (const page of tabs) {
+      // If this tab died on a PeopleSoft error page, it has no search box and is
+      // stuck forever — try to reload the search page and re-run its class search.
+      if (await tabIsBroken(page)) {
+        const q = tabClass.get(page);
+        log(`⚠️  ${q || "A"} tab hit a PeopleSoft error page — reloading & re-searching.`);
+        const healed = await recoverTab(page, q);
+        if (healed) {
+          searched++;
+          searchFails.set(page, 0);
+          brokenNotified.set(page, 0);
+          log(`   ↳ recovered${q ? ` the ${q} tab` : ""}.`);
+          continue;
+        }
+        if ((brokenNotified.get(page) || 0) === 0) {
+          notify(
+            "A class tab needs sign-in",
+            `${q || "A tab"} hit a PeopleSoft error and I couldn't auto-fix it — ` +
+              "open that tab in the browser and click Sign in to PeopleSoft.",
+            { push: false } // local only — a tab hiccup isn't your friend's problem
+          );
+          brokenNotified.set(page, 1);
+        }
+        log(`   ↳ couldn't auto-recover — that tab likely needs a manual sign-in.`);
+        continue;
+      }
+
       // Clear any leftover "no results" popup first — it's a blocking modal, so
       // until it's gone the keyword box underneath isn't clickable and this tab
       // would stay frozen (never seeing the class return). Clicking its OK frees it.
