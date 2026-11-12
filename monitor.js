@@ -368,6 +368,41 @@ export async function searchFor(page, query) {
   return false;
 }
 
+// PeopleSoft shows a blocking modal — "The search returns no results that match
+// the criteria specified." — when a search finds nothing (e.g. a class that's been
+// temporarily unlisted). While it's up, the keyword box underneath can't be clicked,
+// so that tab would freeze and never notice the class coming back. This finds that
+// dialog by its message text and clicks its OK button to clear it. Returns true if
+// it dismissed one.
+export async function dismissNoResults(page) {
+  let clicked = false;
+  for (const frame of page.frames()) {
+    let did;
+    try {
+      did = await frame.evaluate(() => {
+        const body = document.body?.innerText || "";
+        if (!/no results that match|returns no results/i.test(body)) return false;
+        const els = document.querySelectorAll('input, button, a, [role="button"]');
+        for (const el of els) {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue; // skip hidden
+          const label = (el.value || el.innerText || el.textContent || "").trim();
+          if (/^ok$/i.test(label)) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      });
+    } catch {
+      continue; // frame may have navigated away
+    }
+    if (did) clicked = true;
+  }
+  if (clicked) await page.waitForTimeout(500); // give the modal a moment to close
+  return clicked;
+}
+
 // Diagnostic: list the inputs/buttons/links in every frame so we can identify
 // the real search control when the heuristics above miss.
 async function dumpControls(page) {
@@ -493,6 +528,9 @@ async function main() {
   const DUMP_AFTER = 3;
   const searchFails = new Map();
   let offlineStreak = 0;
+  // Sections that have dropped out of the results entirely (e.g. a class that got
+  // temporarily unlisted). We remember them so we can ping when they come BACK.
+  const missing = new Set();
   while (true) {
     await new Promise((r) => setTimeout(r, INTERVAL_MS));
 
@@ -527,6 +565,12 @@ async function main() {
     let searched = 0;
     const methods = new Set();
     for (const page of tabs) {
+      // Clear any leftover "no results" popup first — it's a blocking modal, so
+      // until it's gone the keyword box underneath isn't clickable and this tab
+      // would stay frozen (never seeing the class return). Clicking its OK frees it.
+      if (await dismissNoResults(page)) {
+        log("Dismissed a 'no results' popup so the search can run again.");
+      }
       const how = await clickSearch(page);
       if (how === null) {
         const n = (searchFails.get(page) || 0) + 1;
@@ -563,8 +607,29 @@ async function main() {
       continue;
     }
 
+    // Note any known section that dropped out of the results entirely (class
+    // temporarily unlisted). No phone push for a disappearance — but remember it so
+    // its return becomes a loud "it's back" alert below.
+    for (const id of baseline.keys()) {
+      if (!now.has(id) && !missing.has(id)) {
+        const g = baseline.get(id);
+        log(`➖ No longer listed: ${g.label} (was Open ${g.open}, WL ${wl(g)}). Will ping if it returns.`);
+        missing.add(id);
+      }
+    }
+
     let anyChange = false;
     for (const [id, s] of now) {
+      // A section that had dropped out is back on the schedule — that's exactly the
+      // "available again" signal, so push it to phones.
+      if (missing.has(id)) {
+        missing.delete(id);
+        anyChange = true;
+        log(`🔼 BACK: ${s.label}: Open = ${s.open}, Waitlist = ${wl(s)}`);
+        notify(`${s.label} — back on the schedule`, `Open ${s.open}, Waitlist ${wl(s)}`);
+        baseline.set(id, s);
+        continue;
+      }
       const prev = baseline.get(id);
       if (!prev) {
         log(`➕ New section appeared: ${s.label}: Open = ${s.open}, Waitlist = ${wl(s)}`);
