@@ -374,6 +374,26 @@ export async function searchFor(page, query) {
   return false;
 }
 
+// True if any tab is sitting on the CalNet sign-in page — i.e. the whole session
+// expired (CalNet has a hard timeout that re-searching can't keep alive). When this
+// is the case the monitor can't read anything until you sign in again.
+export async function anyTabLoggedOut(tabs) {
+  for (const page of tabs) {
+    for (const frame of page.frames()) {
+      let text;
+      try {
+        text = await frame.evaluate(() => document.body?.innerText || "");
+      } catch {
+        continue;
+      }
+      if (/calnet id|sign in to campus solutions|sign in with your calnet/i.test(text)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // A PeopleSoft tab sometimes dies on a generic error screen ("An error has
 // occurred — Sign in to PeopleSoft — make sure Webserver and Appserver are up"):
 // its per-tab server session hiccupped. The tab is then stuck — no search box —
@@ -627,6 +647,9 @@ async function main() {
   const missing = new Set();
   // Tabs we've already warned about being stuck on an error page (so we notify once).
   const brokenNotified = new Map();
+  // How many cycles in a row we've been unable to read anything (e.g. signed out),
+  // so we alert ONCE instead of popping + speaking a notification every minute.
+  let cantReadStreak = 0;
   while (true) {
     await new Promise((r) => setTimeout(r, INTERVAL_MS));
 
@@ -720,13 +743,30 @@ async function main() {
     const now = await snapshot();
 
     if (now.size === 0) {
-      log("Could not read any sections this cycle (session may have expired?).");
-      notify(
-        "Monitor can't read the page",
-        "No Open counts found — you may need to log in again.",
-        { push: false } // local only — a login hiccup isn't your friend's problem
+      cantReadStreak++;
+      const loggedOut = await anyTabLoggedOut(tabs);
+      log(
+        loggedOut
+          ? `🔒 Signed out of CalNet — can't read anything until you sign in (cycle ${cantReadStreak}).`
+          : `Could not read any sections this cycle (cycle ${cantReadStreak}; session may have expired?).`
       );
+      // Alert only on the FIRST blind cycle, so a long sign-out doesn't pop + speak
+      // a notification every single minute.
+      if (cantReadStreak === 1) {
+        notify(
+          loggedOut ? "Monitor paused — sign in to CalNet" : "Monitor can't read the page",
+          loggedOut
+            ? "You're signed out of CalNet. Open the browser, click Sign in to Campus " +
+              "Solutions, finish Duo, then re-run your searches — I'll pick it back up."
+            : "No Open counts found — the page may have changed or you may need to log in again.",
+          { push: false } // local only — a login hiccup isn't your friend's problem
+        );
+      }
       continue;
+    }
+    if (cantReadStreak > 0) {
+      log(`✅ Reading sections again after ${cantReadStreak} blind cycle(s).`);
+      cantReadStreak = 0;
     }
 
     // Note any known section that dropped out of the results entirely (class
